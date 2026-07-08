@@ -114,19 +114,20 @@ export default {
       if (data.code === 200) {
         const redirectUrl = data.data.redirect_url;
 
-        const redirectResponse = await fetch(redirectUrl, { redirect: 'manual' });
+        const redirectResponse = await fetch(redirectUrl);
+        const responseBody = await redirectResponse.text();
 
-        const setCookie = redirectResponse.headers.get('set-cookie');
-
-        if (setCookie) {
-          proxyCookie = setCookie;
+        // Extract ugreen-proxy-token from JavaScript document.cookie in HTML body
+        const tokenMatch = responseBody.match(/ugreen-proxy-token=([^;]+)/);
+        if (tokenMatch) {
+          proxyCookie = `ugreen-proxy-token=${tokenMatch[1]}`;
           proxyOrigin = new URL(redirectUrl).origin;
           // Cache proxy cookie and origin for 1 hour
           await env.UGLINK_CACHE.put(cookieCacheKey, proxyCookie, { expirationTtl: 3600 });
           await env.UGLINK_CACHE.put(originCacheKey, proxyOrigin, { expirationTtl: 3600 });
         } else {
-          console.error('UGLINK Worker: No set-cookie in redirect response');
-          return new Response('No set-cookie in redirect response', { status: 500 });
+          console.error('UGLINK Worker: No ugreen-proxy-token found in response body');
+          return new Response('No ugreen-proxy-token found in response body', { status: 500 });
         }
       } else {
         console.error('UGLINK Worker: API returned error', { msg: data.msg });
