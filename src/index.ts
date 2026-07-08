@@ -370,6 +370,28 @@ export default {
     responseHeaders.set('X-Content-Type-Options', 'nosniff');
     responseHeaders.set('X-Frame-Options', 'DENY');
 
+    // --- 路径反向重写（后端 /dav/ → 客户端 /webdav/）---
+    if (route.stripPath && route.rewriteTo) {
+      // 重写 Location header
+      const location = responseHeaders.get('Location');
+      if (location && location.startsWith(route.rewriteTo)) {
+        responseHeaders.set('Location', route.path + location.slice(route.rewriteTo.length));
+      }
+
+      // 重写文本响应体中的路径
+      const contentType = responseHeaders.get('Content-Type') || '';
+      const isText = /text|xml|json|html/i.test(contentType);
+      if (isText && proxyResponse.body) {
+        const originalBody = await proxyResponse.text();
+        const rewritten = originalBody.split(route.rewriteTo).join(route.path);
+        return new Response(rewritten, {
+          status: proxyResponse.status,
+          statusText: proxyResponse.statusText,
+          headers: responseHeaders,
+        });
+      }
+    }
+
     return new Response(proxyResponse.body, {
       status: proxyResponse.status,
       statusText: proxyResponse.statusText,
