@@ -1,10 +1,25 @@
 import JSEncrypt from 'jsencrypt';
 
+// ==================== 路由配置 ====================
+// 添加新服务只需在这里加一行
+interface Route {
+  path: string;        // URL 路径前缀
+  port: number;        // 后端端口
+  stripPath: boolean;  // 转发时是否去掉路径前缀
+  rewriteTo: string;   // 去掉前缀后替换为（空=直接拼接剩余路径）
+  requireAuth: boolean;// 是否需要 Worker 层认证
+}
+
+const ROUTES: Route[] = [
+  { path: '/webdav/', port: 5445,  stripPath: true,  rewriteTo: '/dav/',  requireAuth: false },
+  { path: '/',         port: 38521, stripPath: false, rewriteTo: '',       requireAuth: true  },
+];
+
 // ==================== 安全配置 ====================
 const SESSION_COOKIE = 'uglink-session';
 const SESSION_MAX_AGE = 7 * 24 * 60 * 60; // 7 天
-const BLOCKED_PATHS = ['/ugreen/', '/api/ugreen/']; // 管理路径黑名单
-const ALLOWED_METHODS = ['GET', 'POST', 'HEAD', 'OPTIONS'];
+const BLOCKED_PATHS = ['/ugreen/', '/api/ugreen/'];
+const ALLOWED_METHODS = ['GET', 'POST', 'HEAD', 'OPTIONS', 'PUT', 'DELETE', 'PROPFIND', 'PROPPATCH', 'MKCOL', 'COPY', 'MOVE', 'LOCK', 'UNLOCK', 'PATCH'];
 const HMAC_KEY_NAME = 'session-hmac-key';
 
 // ==================== 登录页 HTML ====================
@@ -40,15 +55,10 @@ const LOGIN_PAGE = `<!DOCTYPE html>
 
 // ==================== 工具函数 ====================
 
-// 获取或生成 HMAC key
 async function getHmacKey(env: any): Promise<CryptoKey> {
   let keyData = await env.UGLINK_CACHE.get(HMAC_KEY_NAME);
   if (!keyData) {
-    const key = await crypto.subtle.generateKey(
-      { name: 'HMAC', hash: 'SHA-256' },
-      true,
-      ['sign', 'verify']
-    );
+    const key = await crypto.subtle.generateKey({ name: 'HMAC', hash: 'SHA-256' }, true, ['sign', 'verify']);
     const exported = await crypto.subtle.exportKey('raw', key);
     keyData = btoa(String.fromCharCode(...new Uint8Array(exported)));
     await env.UGLINK_CACHE.put(HMAC_KEY_NAME, keyData);
@@ -57,58 +67,145 @@ async function getHmacKey(env: any): Promise<CryptoKey> {
   return crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
 }
 
-// 签名 cookie
 async function signCookie(value: string, env: any): Promise<string> {
   const key = await getHmacKey(env);
   const data = new TextEncoder().encode(value);
   const sig = await crypto.subtle.sign('HMAC', key, data);
-  const sigHex = btoa(String.fromCharCode(...new Uint8Array(sig)));
-  return `${value}.${sigHex}`;
+  return `${value}.${btoa(String.fromCharCode(...new Uint8Array(sig)))}`;
 }
 
-// 验证 cookie
 async function verifyCookie(signed: string, env: any): Promise<boolean> {
   const parts = signed.split('.');
   if (parts.length !== 2) return false;
-  const value = parts[0];
   const key = await getHmacKey(env);
-  const data = new TextEncoder().encode(value);
+  const data = new TextEncoder().encode(parts[0]);
   const sig = Uint8Array.from(atob(parts[1]), c => c.charCodeAt(0));
   return crypto.subtle.verify('HMAC', key, sig, data);
 }
 
-// 检查认证
 async function isAuthenticated(request: Request, env: any): Promise<boolean> {
+  // Session Cookie
   const cookie = request.headers.get('Cookie') || '';
   const match = cookie.match(new RegExp(`${SESSION_COOKIE}=([^;]+)`));
-  if (!match) return false;
-
-  const signed = match[1];
-  if (!(await verifyCookie(signed, env))) return false;
-
-  // 检查过期（格式: timestamp）
-  const value = signed.split('.')[0];
-  const timestamp = parseInt(value, 10);
-  if (isNaN(timestamp)) return false;
-  if (Date.now() / 1000 - timestamp > SESSION_MAX_AGE) return false;
-
-  return true;
+  if (match) {
+    const signed = match[1];
+    if (await verifyCookie(signed, env)) {
+      const timestamp = parseInt(signed.split('.')[0], 10);
+      if (!isNaN(timestamp) && Date.now() / 1000 - timestamp <= SESSION_MAX_AGE) return true;
+    }
+  }
+  // Basic Auth
+  const authHeader = request.headers.get('Authorization') || '';
+  if (authHeader.startsWith('Basic ')) {
+    try {
+      const decoded = atob(authHeader.slice(6));
+      const [, password] = decoded.split(':');
+      if (password === env.ACCESS_PASSWORD) return true;
+    } catch {}
+  }
+  return false;
 }
 
-// 返回登录页
 function showLoginPage(error = false): Response {
-  const html = error
-    ? LOGIN_PAGE.replace('display: none', 'display: block')
-    : LOGIN_PAGE;
-  return new Response(html, {
-    headers: { 'Content-Type': 'text/html; charset=utf-8' },
-  });
+  const html = error ? LOGIN_PAGE.replace('display: none', 'display: block') : LOGIN_PAGE;
+  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
-// 通用错误响应（不泄露服务端详情）
 function errorResponse(msg: string): Response {
   console.error('UGLINK Worker:', msg);
   return new Response('Service temporarily unavailable', { status: 500 });
+}
+
+// ==================== uglink 认证 + 代理获取 ====================
+async function getProxyForPort(port: number, env: any): Promise<{ cookie: string; origin: string } | null> {
+  const cookieKey = `proxy_cookie_${port}`;
+  const originKey = `proxy_origin_${port}`;
+
+  let proxyCookie = await env.UGLINK_CACHE.get(cookieKey);
+  let proxyOrigin = await env.UGLINK_CACHE.get(originKey);
+
+  if (proxyCookie && proxyOrigin) {
+    return { cookie: proxyCookie, origin: proxyOrigin };
+  }
+
+  const baseUrl = env.BASE_URL;
+  const username = env.USERNAME;
+  const rawPassword = env.PASSWORD;
+
+  // 获取加密公钥
+  const checkResponse = await fetch(`${baseUrl}/ugreen/v1/verify/check?token=`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username }),
+  });
+  if (!checkResponse.ok) return null;
+
+  const rsaToken = checkResponse.headers.get('x-rsa-token');
+  if (!rsaToken) return null;
+
+  const encryptionPublicKey = atob(rsaToken);
+  const enc1 = new JSEncrypt();
+  enc1.setPublicKey(encryptionPublicKey);
+  const encryptedPassword = enc1.encrypt(rawPassword);
+  if (!encryptedPassword) return null;
+
+  // 登录
+  const loginResponse = await fetch(`${baseUrl}/ugreen/v1/verify/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password: encryptedPassword, keepalive: true, otp: true, is_simple: true }),
+  });
+  if (!loginResponse.ok) return null;
+
+  const loginJson = await loginResponse.json();
+  if (loginJson.code !== 200) return null;
+
+  // 加密 token
+  const decodedPublicKey = atob(loginJson.data.public_key);
+  const enc2 = new JSEncrypt();
+  enc2.setPublicKey(decodedPublicKey);
+  const encryptedToken = enc2.encrypt(loginJson.data.token);
+  if (!encryptedToken) return null;
+
+  // 获取 docker token
+  const tokenResponse = await fetch(`${baseUrl}/ugreen/v1/gateway/proxy/dockerToken?port=${port}`, {
+    headers: {
+      'X-Ugreen-Token': encryptedToken,
+      'X-Ugreen-Security-Key': loginJson.data.token_id,
+    },
+  });
+  if (!tokenResponse.ok) return null;
+
+  const data = await tokenResponse.json();
+  if (data.code !== 200) return null;
+
+  const redirectUrl = data.data.redirect_url;
+
+  // SSRF 防护
+  if (!/\.ug(link|docker)\./.test(new URL(redirectUrl).hostname)) return null;
+
+  const redirectResponse = await fetch(redirectUrl);
+  const responseBody = await redirectResponse.text();
+  const tokenMatch = responseBody.match(/ugreen-proxy-token=([^;]+)/);
+  if (!tokenMatch) return null;
+
+  proxyCookie = `ugreen-proxy-token=${tokenMatch[1]}`;
+  proxyOrigin = new URL(redirectUrl).origin;
+
+  await env.UGLINK_CACHE.put(cookieKey, proxyCookie, { expirationTtl: 3600 });
+  await env.UGLINK_CACHE.put(originKey, proxyOrigin, { expirationTtl: 3600 });
+
+  return { cookie: proxyCookie, origin: proxyOrigin };
+}
+
+// ==================== 路由匹配 ====================
+function matchRoute(pathname: string): Route | null {
+  for (const route of ROUTES) {
+    if (route.path === '/' || pathname.startsWith(route.path)) {
+      return route;
+    }
+  }
+  return null;
 }
 
 // ==================== 主逻辑 ====================
@@ -116,12 +213,12 @@ export default {
   async fetch(request: Request, env: any, ctx: any): Promise<Response> {
     const url = new URL(request.url);
 
-    // --- 1. HTTP 方法限制 ---
+    // --- HTTP 方法限制 ---
     if (!ALLOWED_METHODS.includes(request.method)) {
       return new Response('Method not allowed', { status: 405 });
     }
 
-    // --- 2. 登录处理（在路径过滤之前）---
+    // --- 登录处理 ---
     if (url.pathname === '/__login') {
       if (request.method === 'POST') {
         const formData = await request.formData();
@@ -142,137 +239,47 @@ export default {
       return showLoginPage();
     }
 
-    // --- 3. 路径过滤 ---
-    const pathname = url.pathname.toLowerCase();
+    // --- 路径过滤 ---
     for (const blocked of BLOCKED_PATHS) {
-      if (pathname.startsWith(blocked)) {
+      if (url.pathname.toLowerCase().startsWith(blocked)) {
         return new Response('Not found', { status: 404 });
       }
     }
 
-    // --- 4. 认证检查 ---
-    if (!(await isAuthenticated(request, env))) {
-      return showLoginPage();
-    }
+    // --- 路由匹配 ---
+    const route = matchRoute(url.pathname);
+    if (!route) return new Response('Not found', { status: 404 });
 
-    // --- 5. 业务逻辑（原有反代 + 安全加固）---
-    const baseUrl = env.BASE_URL;
-    const port = env.PORT;
-    const username = env.USERNAME;
-    const rawPassword = env.PASSWORD;
-    const cookieCacheKey = 'proxy_cookie';
-    const originCacheKey = 'proxy_origin';
-
-    let proxyCookie = await env.UGLINK_CACHE.get(cookieCacheKey);
-    let proxyOrigin = await env.UGLINK_CACHE.get(originCacheKey);
-
-    if (!proxyCookie) {
-      // 获取加密公钥
-      const checkUrl = `${baseUrl}/ugreen/v1/verify/check?token=`;
-      const checkResponse = await fetch(checkUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username }),
-      });
-
-      if (!checkResponse.ok) {
-        return errorResponse('Failed to get encryption key');
-      }
-
-      const rsaToken = checkResponse.headers.get('x-rsa-token');
-      if (!rsaToken) {
-        return errorResponse('No x-rsa-token in check response');
-      }
-
-      const encryptionPublicKey = atob(rsaToken);
-      const encryptPassword = new JSEncrypt();
-      encryptPassword.setPublicKey(encryptionPublicKey);
-      const encryptedPassword = encryptPassword.encrypt(rawPassword);
-
-      if (!encryptedPassword) {
-        return errorResponse('Failed to encrypt password');
-      }
-
-      // 登录
-      const loginUrl = `${baseUrl}/ugreen/v1/verify/login`;
-      const loginResponse = await fetch(loginUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          username,
-          password: encryptedPassword,
-          keepalive: true,
-          otp: true,
-          is_simple: true,
-        }),
-      });
-
-      if (!loginResponse.ok) {
-        return errorResponse('Login failed');
-      }
-
-      const loginJson = await loginResponse.json();
-
-      if (loginJson.code !== 200) {
-        return errorResponse('Login API error');
-      }
-
-      // 加密 token
-      const encodedPublicKey = loginJson.data.public_key;
-      const decodedPublicKey = atob(encodedPublicKey);
-      const encrypt = new JSEncrypt();
-      encrypt.setPublicKey(decodedPublicKey);
-      const encryptedToken = encrypt.encrypt(loginJson.data.token);
-
-      if (!encryptedToken) {
-        return errorResponse('Failed to encrypt token');
-      }
-
-      // 获取 docker token
-      const apiUrl = `${baseUrl}/ugreen/v1/gateway/proxy/dockerToken?port=${port}`;
-      const response = await fetch(apiUrl, {
-        headers: {
-          'X-Ugreen-Token': encryptedToken,
-          'X-Ugreen-Security-Key': loginJson.data.token_id,
-        },
-      });
-
-      if (!response.ok) {
-        return errorResponse('Failed to fetch docker token');
-      }
-
-      const data = await response.json();
-
-      if (data.code === 200) {
-        const redirectUrl = data.data.redirect_url;
-
-        // SSRF 防护：验证 redirectUrl 来源
-        const redirectOrigin = new URL(redirectUrl).origin;
-        const allowedHostPattern = /\.ug(link|docker)\./;
-        if (!allowedHostPattern.test(new URL(redirectUrl).hostname)) {
-          return errorResponse('Invalid redirect target');
+    // --- 认证检查（仅对 requireAuth 的路由）---
+    if (route.requireAuth) {
+      if (!(await isAuthenticated(request, env))) {
+        const hasBasicAuth = (request.headers.get('Authorization') || '').startsWith('Basic ');
+        if (hasBasicAuth) {
+          return new Response('Unauthorized', {
+            status: 401,
+            headers: { 'WWW-Authenticate': 'Basic realm="uglink-bridge"' },
+          });
         }
-
-        const redirectResponse = await fetch(redirectUrl);
-        const responseBody = await redirectResponse.text();
-
-        const tokenMatch = responseBody.match(/ugreen-proxy-token=([^;]+)/);
-        if (tokenMatch) {
-          proxyCookie = `ugreen-proxy-token=${tokenMatch[1]}`;
-          proxyOrigin = redirectOrigin;
-          await env.UGLINK_CACHE.put(cookieCacheKey, proxyCookie, { expirationTtl: 3600 });
-          await env.UGLINK_CACHE.put(originCacheKey, proxyOrigin, { expirationTtl: 3600 });
-        } else {
-          return errorResponse('Auth token not found');
-        }
-      } else {
-        return errorResponse('Docker token API error');
+        return showLoginPage();
       }
     }
 
-    // --- 6. 反向代理（带安全过滤）---
-    const proxyUrl = proxyOrigin + url.pathname + url.search;
+    // --- 获取代理凭证（每个端口独立缓存）---
+    const proxy = await getProxyForPort(route.port, env);
+    if (!proxy) return errorResponse('Failed to get proxy');
 
+    // --- 构造代理 URL ---
+    let proxyPath = url.pathname + url.search;
+    if (route.stripPath) {
+      // 去掉路由前缀，用 rewriteTo 替换
+      // /webdav/       → /dav/
+      // /webdav/folder → /dav/folder
+      const remaining = url.pathname.slice(route.path.length);
+      proxyPath = route.rewriteTo + remaining + url.search;
+    }
+    const proxyUrl = proxy.origin + proxyPath;
+
+    // --- 转发请求 ---
     const proxyHeaders = new Headers();
     for (const [key, value] of request.headers) {
       const k = key.toLowerCase();
@@ -280,8 +287,8 @@ export default {
       if (k.startsWith('cf-') || k.startsWith('x-forwarded-')) continue;
       proxyHeaders.set(key, value);
     }
-    proxyHeaders.set('Host', new URL(proxyOrigin).host);
-    proxyHeaders.set('Cookie', proxyCookie);
+    proxyHeaders.set('Host', new URL(proxy.origin).host);
+    proxyHeaders.set('Cookie', proxy.cookie);
 
     const proxyResponse = await fetch(proxyUrl, {
       method: request.method,
@@ -289,10 +296,9 @@ export default {
       body: request.method !== 'GET' && request.method !== 'HEAD' ? request.body : undefined,
     });
 
-    // 过滤响应头
+    // --- 过滤响应头 ---
     const responseHeaders = new Headers(proxyResponse.headers);
-    const headersToRemove = ['set-cookie', 'x-powered-by', 'server', 'x-aspnet-version', 'x-aspnetmvc-version'];
-    for (const h of headersToRemove) {
+    for (const h of ['set-cookie', 'x-powered-by', 'server', 'x-aspnet-version', 'x-aspnetmvc-version']) {
       responseHeaders.delete(h);
     }
 
